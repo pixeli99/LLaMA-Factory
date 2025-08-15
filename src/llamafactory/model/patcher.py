@@ -39,7 +39,10 @@ from .model_utils.visual import autocast_projector_dtype, configure_visual_model
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig, PreTrainedTokenizer, ProcessorMixin
-    from trl import AutoModelForCausalLMWithValueHead
+    try:
+        from trl import AutoModelForCausalLMWithValueHead  # type: ignore
+    except Exception:  # optional dependency; used only when value head is enabled
+        AutoModelForCausalLMWithValueHead = None  # type: ignore
 
     from ..hparams import ModelArguments
 
@@ -177,10 +180,19 @@ def patch_model(
             except Exception:
                 logger.warning_rank0("Cannot set do_sample on custom generation config.")
 
-    if getattr(model.config, "model_type", None) not in ["minicpmv", "minicpmo"] and "GenerationMixin" not in str(
-        model.generate.__func__
-    ):
-        model.generate = MethodType(GenerationMixin.generate, model)
+    if getattr(model.config, "model_type", None) not in ["minicpmv", "minicpmo"]:
+        need_patch_generate = False
+        if hasattr(model, "generate"):
+            try:
+                need_patch_generate = "GenerationMixin" not in str(model.generate.__func__)  # type: ignore[attr-defined]
+            except Exception:
+                need_patch_generate = False
+        # Only patch when `generate` exists and clearly not coming from GenerationMixin
+        if need_patch_generate:
+            try:
+                model.generate = MethodType(GenerationMixin.generate, model)
+            except Exception:
+                logger.warning_rank0("Skip patching generate() on this model.")
 
     if add_valuehead:
         prepare_valuehead_model(model)
