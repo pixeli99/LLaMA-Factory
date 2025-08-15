@@ -158,13 +158,24 @@ def patch_model(
     is_trainable: bool,
     add_valuehead: bool,
 ) -> None:
-    gen_config = model.generation_config  # check and fix generation config
-    if not gen_config.do_sample and (
-        (gen_config.temperature is not None and gen_config.temperature != 1.0)
-        or (gen_config.top_p is not None and gen_config.top_p != 1.0)
-        or (gen_config.typical_p is not None and gen_config.typical_p != 1.0)
-    ):
-        gen_config.do_sample = True
+    gen_config = getattr(model, "generation_config", None)  # check and fix generation config
+    if gen_config is not None:
+        temperature = getattr(gen_config, "temperature", None)
+        top_p = getattr(gen_config, "top_p", None)
+        typical_p = getattr(gen_config, "typical_p", None)
+        do_sample = getattr(gen_config, "do_sample", None)
+
+        need_sampling = (
+            (temperature is not None and temperature != 1.0)
+            or (top_p is not None and top_p != 1.0)
+            or (typical_p is not None and typical_p != 1.0)
+        )
+
+        if need_sampling and (do_sample in [None, False]):
+            try:
+                setattr(gen_config, "do_sample", True)
+            except Exception:
+                logger.warning_rank0("Cannot set do_sample on custom generation config.")
 
     if getattr(model.config, "model_type", None) not in ["minicpmv", "minicpmo"] and "GenerationMixin" not in str(
         model.generate.__func__
