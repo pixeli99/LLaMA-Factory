@@ -166,7 +166,17 @@ class CustomTrainer(Trainer):
         if mask_token_id is None:
             pad_id = getattr(getattr(self, "processing_class", None), "pad_token_id", None)
             mask_token_id = pad_id if pad_id is not None else 0
-        vocab_size = int(model.config.vocab_size)
+        # Minimal, stable vocab size inference:
+        base = getattr(model, "module", model)
+        get_out = getattr(base, "get_output_embeddings", None)
+        if callable(get_out) and getattr(get_out(), "num_embeddings", None):
+            vocab_size = int(get_out().num_embeddings)
+        else:
+            get_in = getattr(base, "get_input_embeddings", None)
+            if callable(get_in) and getattr(get_in(), "num_embeddings", None):
+                vocab_size = int(get_in().num_embeddings)
+            else:
+                vocab_size = int(getattr(getattr(base, "config", {}), "vocab_size", 0) or 32000)
 
         x_t, (alpha_t, p_mask, p_unif, C_t) = self._gidd_sample_z_t(x, t_b, vocab_size, mask_token_id)
         x_t = torch.where(src_mask, x, x_t)
