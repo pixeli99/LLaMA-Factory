@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any, Optional, Union
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from transformers import Seq2SeqTrainer
 from typing_extensions import override
 
@@ -100,6 +101,16 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
     @override
     def compute_loss(self, model, inputs, *args, **kwargs):
+        # DLM training path
+        if getattr(self.finetuning_args, "use_dlm", False):
+            src_mask = inputs["labels"] == IGNORE_INDEX
+            final_loss, _, _ = self.diffusion_forward(
+                model,
+                inputs["input_ids"],
+                src_mask,
+            )
+            return final_loss
+
         return super().compute_loss(model, inputs, *args, **kwargs)
 
     @override
@@ -120,6 +131,17 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         else:
             labels = inputs.get("labels")
 
+        # DLM evaluation path
+        if getattr(self.finetuning_args, "use_dlm", False):
+            if self.args.predict_with_generate:
+                labels = inputs.pop("labels", None)
+            else:
+                labels = inputs.get("labels")
+
+            src_mask = labels == IGNORE_INDEX if labels is not None else None
+            loss, _, _ = self.diffusion_forward(model, inputs["input_ids"], src_mask)
+            return loss, None, None
+
         loss, generated_tokens, _ = super().prediction_step(
             model, inputs, prediction_loss_only=prediction_loss_only, ignore_keys=ignore_keys, **gen_kwargs
         )
@@ -128,6 +150,75 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             generated_tokens = generated_tokens.contiguous()
 
         return loss, generated_tokens, labels
+
+    # ===================== DLM specific helpers =====================
+    def transition(self, x_0: torch.Tensor, sigma: torch.Tensor, maskable_mask: torch.Tensor) -> torch.Tensor:
+        move_chance = sigma
+        move_indices = (torch.rand(*x_0.shape, device=x_0.device) < move_chance) & maskable_mask
+        mask_token_id = getattr(self.processing_class, "mask_token_id", None)
+        if mask_token_id is None:
+            mask_token_id = self.processing_class.pad_token_id
+        x_t = torch.where(move_indices, torch.as_tensor(mask_token_id, device=x_0.device, dtype=x_0.dtype), x_0)
+        return x_t
+
+    def diffusion_forward(
+        self,
+        model: "torch.nn.Module",
+        x: torch.Tensor,
+        src_mask: Optional[torch.Tensor],
+        sampling_eps: float = 1e-3,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch_size = x.shape[0]
+        if src_mask is None:
+            src_mask = torch.zeros_like(x, device=x.device, dtype=torch.bool)
+
+        # Sample noise level
+        t = (1 - sampling_eps) * torch.rand(x.shape[0], device=x.device) + sampling_eps
+
+        # Compute sigma and dsigma
+        sigma = t
+        dsigma = torch.reciprocal(t)
+
+        # Apply noise to input
+        x_t = self.transition(x, sigma[:, None], maskable_mask=~src_mask)
+
+        # Forward pass (intentionally no attention mask)
+        logits = model(input_ids=x_t, attention_mask=None).logits
+
+        # Apply mask for loss computation
+        mask_token_id = getattr(self.processing_class, "mask_token_id", None)
+        if mask_token_id is None:
+            mask_token_id = self.processing_class.pad_token_id
+        loss_mask = x_t == mask_token_id
+
+        # Shift loss
+        logits = logits[:, :-1]
+        loss_mask = loss_mask[:, 1:]
+        x_target = x[:, 1:]
+
+        # Compute loss
+        loss = F.cross_entropy(
+            logits.reshape(-1, logits.shape[-1]),
+            x_target.reshape(-1),
+            reduction="none",
+        ).float().reshape(batch_size, -1)
+
+        loss = loss.masked_fill(~loss_mask, 0)
+        final_loss = (dsigma[:, None] * loss).sum() / loss_mask.sum().clamp_min(1)
+        unweighted_loss = loss.sum() / loss_mask.sum().clamp_min(1)
+
+        return final_loss, unweighted_loss, x_t
+
+    def _get_dynamic_ratio(self) -> float:
+        if not hasattr(self.state, "global_step") or not hasattr(self.state, "max_steps"):
+            logger.warning("State not initialized, using default ratio")
+            return 0.9
+
+        progress = self.state.global_step / self.state.max_steps
+        if progress < 1 / 5:
+            return progress * 5
+        else:
+            return 1.0
 
     def save_predictions(
         self, dataset: "Dataset", predict_results: "PredictionOutput", skip_special_tokens: bool = True

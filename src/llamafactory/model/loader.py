@@ -94,6 +94,17 @@ def load_tokenizer(model_args: "ModelArguments") -> "TokenizerModule":
 
     patch_tokenizer(tokenizer, model_args)
 
+    # Add DLM pad token as special pad token if not present and expose mask_token_id
+    try:
+        if tokenizer.pad_token is None:
+            num_added = tokenizer.add_special_tokens({"pad_token": "<|dlm_pad|>"})
+            if num_added > 0 and not getattr(model_args, "resize_vocab", False):
+                setattr(model_args, "resize_vocab", True)
+        # Always expose mask_token_id for DLM; default to pad
+        setattr(tokenizer, "mask_token_id", tokenizer.pad_token_id)
+    except Exception as e:
+        logger.info_rank0(f"Skip adding DLM pad token or setting mask_token_id: {e}.")
+
     try:
         processor = AutoProcessor.from_pretrained(
             model_args.model_name_or_path,
@@ -165,6 +176,7 @@ def load_model(
             elif type(config) in AutoModelForTextToWaveform._model_mapping.keys():  # audio hack for qwen2_5_omni
                 load_class = AutoModelForTextToWaveform
             else:
+                # For DLM training, we only need logits from the base model. Using AutoModel is safe too.
                 load_class = AutoModelForCausalLM
 
             if model_args.train_from_scratch:

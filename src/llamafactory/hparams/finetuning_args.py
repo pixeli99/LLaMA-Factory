@@ -460,6 +460,10 @@ class FinetuningArguments(
         default=False,
         metadata={"help": "Whether or not to compute effective tokens per second."},
     )
+    use_dlm: bool = field(
+        default=False,
+        metadata={"help": "Enable Discrete Latent Masking (DiffuCoder) training path in SFT."},
+    )
 
     def __post_init__(self):
         def split_arg(arg):
