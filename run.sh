@@ -6,4 +6,7 @@ llamafactory-cli train \
   --template qwen \
   --cutoff_len 4096 \
   --finetuning_type full \
-  --use_dlm true
+  --use_gidd true \
+  --gidd_pu 0.1 \
+  --gidd_gamma 1.0 \
+  --gidd_wmax 1.0

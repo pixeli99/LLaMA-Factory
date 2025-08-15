@@ -101,6 +101,16 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
     @override
     def compute_loss(self, model, inputs, *args, **kwargs):
+        # GIDD training path (superset; falls back to MDM when p_u=0)
+        if getattr(self.finetuning_args, "use_gidd", False):
+            src_mask = inputs["labels"] == IGNORE_INDEX
+            final_loss = self.gidd_forward(
+                model,
+                inputs["input_ids"],
+                src_mask,
+            )
+            return final_loss
+
         # DLM training path
         if getattr(self.finetuning_args, "use_dlm", False):
             src_mask = inputs["labels"] == IGNORE_INDEX
@@ -131,6 +141,17 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         else:
             labels = inputs.get("labels")
 
+        # GIDD evaluation path
+        if getattr(self.finetuning_args, "use_gidd", False):
+            if self.args.predict_with_generate:
+                labels = inputs.pop("labels", None)
+            else:
+                labels = inputs.get("labels")
+
+            src_mask = labels == IGNORE_INDEX if labels is not None else None
+            loss = self.gidd_forward(model, inputs["input_ids"], src_mask)
+            return loss, None, None
+
         # DLM evaluation path
         if getattr(self.finetuning_args, "use_dlm", False):
             if self.args.predict_with_generate:
@@ -160,6 +181,129 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             mask_token_id = self.processing_class.pad_token_id
         x_t = torch.where(move_indices, torch.as_tensor(mask_token_id, device=x_0.device, dtype=x_0.dtype), x_0)
         return x_t
+
+    # ===================== GIDD helpers (training loss only) =====================
+    def _gidd_mixing_schedule(self, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        pu = torch.as_tensor(self.finetuning_args.gidd_pu, device=t.device, dtype=t.dtype)
+        gamma = torch.as_tensor(self.finetuning_args.gidd_gamma, device=t.device, dtype=t.dtype)
+        eps = torch.as_tensor(self.finetuning_args.gidd_eps, device=t.device, dtype=t.dtype)
+
+        B = (2.0 ** gamma) * pu / torch.clamp(1.0 - pu, min=eps)
+        c_t = B * torch.pow(t, gamma / 2.0) * torch.pow(1.0 - t, gamma / 2.0)
+        C_t = 1.0 + c_t
+        alpha_t = (1.0 - t) / C_t
+        beta_t = 1.0 - alpha_t
+        return alpha_t, beta_t, c_t, C_t, B
+
+    def _gidd_build_pi_t(self, t: torch.Tensor, vocab_size: int, mask_token_id: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        alpha_t, beta_t, c_t, C_t, B = self._gidd_mixing_schedule(t)
+        device = t.device
+        V = vocab_size
+        # m one-hot and uniform excluding mask
+        m = torch.zeros(V, device=device, dtype=t.dtype)
+        m[mask_token_id] = 1.0
+        u = torch.ones(V, device=device, dtype=t.dtype)
+        u[mask_token_id] = 0.0
+        u = u / max(1, V - 1)
+        beta_pi = (t / C_t) * m + (c_t / C_t) * u
+        pi_t = beta_pi / torch.clamp(beta_t, min=self.finetuning_args.gidd_eps)
+        return alpha_t, beta_t, pi_t, B
+
+    def _gidd_sample_z_t(self, x_ids: torch.Tensor, t: torch.Tensor, vocab_size: int, mask_id: int) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+        gamma = self.finetuning_args.gidd_gamma
+        pu = self.finetuning_args.gidd_pu
+        eps = self.finetuning_args.gidd_eps
+        B = (2.0 ** gamma) * pu / max(eps, (1.0 - pu))
+        c_t = B * (t ** (gamma / 2.0)) * ((1.0 - t) ** (gamma / 2.0))
+        C_t = 1.0 + c_t
+        alpha_t = (1.0 - t) / C_t
+        p_mask = t / C_t
+        p_unif = c_t / C_t
+
+        u = torch.rand_like(x_ids.float())
+        z = x_ids.clone()
+        stay = (u < alpha_t)
+        u2 = torch.rand_like(x_ids.float())
+        mask_region = (~stay) & (u2 < p_mask / (p_mask + p_unif + eps))
+        z[mask_region] = mask_id
+        unif_region = (~stay) & (~mask_region)
+        if unif_region.any():
+            r = torch.randint(low=0, high=vocab_size - 1, size=(int(unif_region.sum().item()),), device=x_ids.device)
+            r = r + (r >= mask_id).long()
+            z[unif_region] = r
+        return z, (alpha_t, p_mask, p_unif, C_t)
+
+    def gidd_forward(
+        self,
+        model: "torch.nn.Module",
+        x: torch.Tensor,
+        src_mask: Optional[torch.Tensor],
+        sampling_eps: float = 1e-4,
+    ) -> torch.Tensor:
+        # sample t ~ U(eps, 1-eps) per batch item
+        if src_mask is None:
+            src_mask = torch.zeros_like(x, device=x.device, dtype=torch.bool)
+
+        t = (1 - 2 * sampling_eps) * torch.rand(x.shape[0], device=x.device) + sampling_eps
+        # Use a single scalar t for simplicity across sequence; broadcast to positions
+        t_b = t.view(-1, 1)
+
+        # ids
+        mask_token_id = getattr(self.processing_class, "mask_token_id", None)
+        if mask_token_id is None:
+            mask_token_id = self.processing_class.pad_token_id
+        vocab_size = int(model.config.vocab_size)
+
+        # forward noising (mixed mask+uniform)
+        x_t, (alpha_t, p_mask, p_unif, C_t) = self._gidd_sample_z_t(x, t_b, vocab_size, mask_token_id)
+        # do not alter source/prompt tokens
+        x_t = torch.where(src_mask, x, x_t)
+
+        # model forward
+        logits = model(input_ids=x_t, attention_mask=None).logits  # (B, L, V)
+        # Align to next-token prediction as in LM training (shift)
+        logits = logits[:, :-1, :]
+        x_theta = logits.log_softmax(dim=-1).exp()  # (B, L-1, V)
+        x = x[:, 1:]
+        x_t = x_t[:, 1:]
+        src_mask = src_mask[:, 1:]
+
+        # distributions
+        alpha_s, beta_s, pi_t_vec, B = self._gidd_build_pi_t(t_b, vocab_size, mask_token_id)
+        # build q_t(.|x)
+        x_onehot = F.one_hot(x, num_classes=vocab_size).float()
+        alpha_b = alpha_s.view(-1, 1, 1)
+        beta_b = beta_s.view(-1, 1, 1)
+        pi_vec = pi_t_vec  # (B,1,V)
+        qx_t = (alpha_b * x_onehot) + (beta_b * pi_vec)
+        qx_t = qx_t.clamp_min(self.finetuning_args.gidd_eps)
+        # q_t(.|x_theta)
+        qtheta_t = (alpha_b * x_theta) + (beta_b * pi_vec)
+        qtheta_t = qtheta_t.clamp_min(self.finetuning_args.gidd_eps)
+
+        # KL over full vocab
+        kl = (qx_t * (qx_t.log() - qtheta_t.log())).sum(dim=-1)
+
+        # pointwise IS on sampled z_t
+        z_onehot = F.one_hot(x_t, num_classes=vocab_size).float()
+        p = (qx_t * z_onehot).sum(dim=-1).clamp_min(self.finetuning_args.gidd_eps)
+        q = (qtheta_t * z_onehot).sum(dim=-1).clamp_min(self.finetuning_args.gidd_eps)
+        ratio = p / q
+        is_term = ratio - ratio.log() - 1.0
+
+        # Dynamic weighting (Eq.20)
+        lam = (alpha_s / torch.clamp(1.0 - alpha_s, min=self.finetuning_args.gidd_eps)).log().view(-1, 1)
+        ind_mask = (x_t == mask_token_id).float()
+        ind_clean = (x_t == x).float()
+        wmax = self.finetuning_args.gidd_wmax
+        dyn = wmax * (1.0 + ind_mask + ((B / vocab_size) * torch.exp(-lam / 2.0) - 1.0) * ind_clean)
+
+        # loss aggregation over tokens then mean over batch
+        # only compute loss on answer tokens (where labels != IGNORE_INDEX)
+        valid_mask = (~src_mask).float()
+        loss_tokens = valid_mask * dyn * (kl + is_term)
+        loss = loss_tokens.sum(dim=-1).mean()
+        return loss
 
     def diffusion_forward(
         self,

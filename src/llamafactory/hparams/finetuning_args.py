@@ -464,6 +464,26 @@ class FinetuningArguments(
         default=False,
         metadata={"help": "Enable Discrete Latent Masking (DiffuCoder) training path in SFT."},
     )
+    use_gidd: bool = field(
+        default=False,
+        metadata={"help": "Enable GIDD (Generalized Interpolating Discrete Diffusion) training path in SFT."},
+    )
+    gidd_pu: float = field(
+        default=0.0,
+        metadata={"help": "Uniform noise ratio p_u at t=0.5. Set 0.0 to recover MDM (mask-only)."},
+    )
+    gidd_gamma: float = field(
+        default=1.0,
+        metadata={"help": "Gamma exponent for c_t in GIDD mixing schedule (recommended 1.0)."},
+    )
+    gidd_wmax: float = field(
+        default=1.0,
+        metadata={"help": "Maximum weight w_max for Dynamic/Clamp weighting in GIDD loss."},
+    )
+    gidd_eps: float = field(
+        default=1e-12,
+        metadata={"help": "Numerical epsilon for logs/divisions in GIDD computations."},
+    )
 
     def __post_init__(self):
         def split_arg(arg):
