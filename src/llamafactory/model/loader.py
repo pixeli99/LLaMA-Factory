@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any, Optional, TypedDict
 import torch
 from transformers import (
     AutoConfig,
+    AutoModel,
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
     AutoModelForSeq2SeqLM,
@@ -177,7 +178,8 @@ def load_model(
                 load_class = AutoModelForTextToWaveform
             else:
                 # For DLM training, we only need logits from the base model. Using AutoModel is safe too.
-                load_class = AutoModelForCausalLM
+                # load_class = AutoModelForCausalLM
+                load_class = AutoModel
 
             if model_args.train_from_scratch:
                 model = load_class.from_config(config, trust_remote_code=model_args.trust_remote_code)
