@@ -240,66 +240,61 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         src_mask: Optional[torch.Tensor],
         sampling_eps: float = 1e-4,
     ) -> torch.Tensor:
-        # sample t ~ U(eps, 1-eps) per batch item
         if src_mask is None:
             src_mask = torch.zeros_like(x, device=x.device, dtype=torch.bool)
 
         t = (1 - 2 * sampling_eps) * torch.rand(x.shape[0], device=x.device) + sampling_eps
-        # Use a single scalar t for simplicity across sequence; broadcast to positions
         t_b = t.view(-1, 1)
 
-        # ids
-        mask_token_id = getattr(self.processing_class, "mask_token_id", None)
+        mask_token_id = getattr(getattr(self, "processing_class", None), "mask_token_id", None)
         if mask_token_id is None:
-            mask_token_id = self.processing_class.pad_token_id
-        vocab_size = int(model.config.vocab_size)
+            pad_id = getattr(getattr(self, "processing_class", None), "pad_token_id", None)
+            mask_token_id = pad_id if pad_id is not None else 0
+        # Minimal, stable vocab size inference:
+        base = getattr(model, "module", model)
+        get_out = getattr(base, "get_output_embeddings", None)
+        if callable(get_out) and getattr(get_out(), "num_embeddings", None):
+            vocab_size = int(get_out().num_embeddings)
+        else:
+            get_in = getattr(base, "get_input_embeddings", None)
+            if callable(get_in) and getattr(get_in(), "num_embeddings", None):
+                vocab_size = int(get_in().num_embeddings)
+            else:
+                vocab_size = int(getattr(getattr(base, "config", {}), "vocab_size", 0) or 32000)
 
-        # forward noising (mixed mask+uniform)
         x_t, (alpha_t, p_mask, p_unif, C_t) = self._gidd_sample_z_t(x, t_b, vocab_size, mask_token_id)
-        # do not alter source/prompt tokens
         x_t = torch.where(src_mask, x, x_t)
 
-        # model forward
-        logits = model(input_ids=x_t, attention_mask=None).logits  # (B, L, V)
-        # Align to next-token prediction as in LM training (shift)
+        logits = model(input_ids=x_t, attention_mask=None).logits
         logits = logits[:, :-1, :]
-        x_theta = logits.log_softmax(dim=-1).exp()  # (B, L-1, V)
+        x_theta = logits.log_softmax(dim=-1).exp()
         x = x[:, 1:]
         x_t = x_t[:, 1:]
         src_mask = src_mask[:, 1:]
 
-        # distributions
         alpha_s, beta_s, pi_t_vec, B = self._gidd_build_pi_t(t_b, vocab_size, mask_token_id)
-        # build q_t(.|x)
         x_onehot = F.one_hot(x, num_classes=vocab_size).float()
         alpha_b = alpha_s.view(-1, 1, 1)
         beta_b = beta_s.view(-1, 1, 1)
-        pi_vec = pi_t_vec  # (B,1,V)
+        pi_vec = pi_t_vec
         qx_t = (alpha_b * x_onehot) + (beta_b * pi_vec)
         qx_t = qx_t.clamp_min(self.finetuning_args.gidd_eps)
-        # q_t(.|x_theta)
         qtheta_t = (alpha_b * x_theta) + (beta_b * pi_vec)
         qtheta_t = qtheta_t.clamp_min(self.finetuning_args.gidd_eps)
 
-        # KL over full vocab
         kl = (qx_t * (qx_t.log() - qtheta_t.log())).sum(dim=-1)
-
-        # pointwise IS on sampled z_t
         z_onehot = F.one_hot(x_t, num_classes=vocab_size).float()
         p = (qx_t * z_onehot).sum(dim=-1).clamp_min(self.finetuning_args.gidd_eps)
         q = (qtheta_t * z_onehot).sum(dim=-1).clamp_min(self.finetuning_args.gidd_eps)
         ratio = p / q
         is_term = ratio - ratio.log() - 1.0
 
-        # Dynamic weighting (Eq.20)
         lam = (alpha_s / torch.clamp(1.0 - alpha_s, min=self.finetuning_args.gidd_eps)).log().view(-1, 1)
         ind_mask = (x_t == mask_token_id).float()
         ind_clean = (x_t == x).float()
         wmax = self.finetuning_args.gidd_wmax
         dyn = wmax * (1.0 + ind_mask + ((B / vocab_size) * torch.exp(-lam / 2.0) - 1.0) * ind_clean)
 
-        # loss aggregation over tokens then mean over batch
-        # only compute loss on answer tokens (where labels != IGNORE_INDEX)
         valid_mask = (~src_mask).float()
         loss_tokens = valid_mask * dyn * (kl + is_term)
         loss = loss_tokens.sum(dim=-1).mean()
