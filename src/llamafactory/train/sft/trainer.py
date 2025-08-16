@@ -299,7 +299,8 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
         valid_mask = (~src_mask).float()
         loss_tokens = valid_mask * dyn * (kl + is_term)
-        loss = loss_tokens.sum(dim=-1).mean()
+        denom = valid_mask.sum(dim=-1).clamp_min(1)
+        loss = (loss_tokens.sum(dim=-1) / denom).mean()
         return loss
 
     def diffusion_forward(
