@@ -123,6 +123,8 @@ class CustomTrainer(Trainer):
         u = u / max(1, V - 1)
         beta_pi = (t / C_t) * m + (c_t / C_t) * u
         pi_t = beta_pi / torch.clamp(beta_t, min=self.finetuning_args.gidd_eps)
+        # Ensure pi_t broadcasts over sequence length: (B, 1, V)
+        pi_t = pi_t.unsqueeze(-2)
         return alpha_t, beta_t, pi_t, B
 
     def _gidd_sample_z_t(self, x_ids: torch.Tensor, t: torch.Tensor, vocab_size: int, mask_id: int) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
