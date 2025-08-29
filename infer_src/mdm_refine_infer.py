@@ -916,9 +916,9 @@ if __name__ == "__main__":
     print(f"{Colors.bold('Performance Metrics:')}")
     print(f"{Colors.bold('='*80)}")
     log = result.refinement_log
-    print(f"  {Colors.cyan('MDM generation time:')} {Colors.bold(f'{log['mdm_time']:.2f}s')}")
-    print(f"  {Colors.cyan('Refinement time:')} {Colors.bold(f'{log['refine_time']:.2f}s')}")
-    print(f"  {Colors.cyan('Total time:')} {Colors.bold(f'{log['mdm_time'] + log['refine_time']:.2f}s')}")
+    print(f"  {Colors.cyan('MDM generation time:')} {Colors.bold(f\"{log['mdm_time']:.2f}s\")}")
+    print(f"  {Colors.cyan('Refinement time:')} {Colors.bold(f\"{log['refine_time']:.2f}s\")}")
+    print(f"  {Colors.cyan('Total time:')} {Colors.bold(f\"{log['mdm_time'] + log['refine_time']:.2f}s\")}")
     
     if log['total_refinements'] > 0:
         print(f"\n  {Colors.cyan('Refinement statistics:')}")
