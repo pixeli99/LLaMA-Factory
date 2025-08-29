@@ -931,4 +931,4 @@ if __name__ == "__main__":
             print(f"\n  {Colors.cyan('Example refinements:')}")
             for ref in log['refined_tokens'][:3]:
                 print(f"    • {Colors.red(repr(ref['old']))} → {Colors.green(repr(ref['new']))} "
-                      f"({Colors.yellow('+' + str(round(ref['improvement'], 3)))})"")
+                      f"({Colors.yellow('+' + str(round(ref['improvement'], 3)))})")
