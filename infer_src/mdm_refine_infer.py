@@ -916,19 +916,19 @@ if __name__ == "__main__":
     print(f"{Colors.bold('Performance Metrics:')}")
     print(f"{Colors.bold('='*80)}")
     log = result.refinement_log
-    print(f"  {Colors.cyan('MDM generation time:')} {Colors.bold(f\"{log['mdm_time']:.2f}s\")}")
-    print(f"  {Colors.cyan('Refinement time:')} {Colors.bold(f\"{log['refine_time']:.2f}s\")}")
-    print(f"  {Colors.cyan('Total time:')} {Colors.bold(f\"{log['mdm_time'] + log['refine_time']:.2f}s\")}")
+    print(f"  {Colors.cyan('MDM generation time:')} {Colors.bold(str(round(log['mdm_time'], 2)) + 's')}")
+    print(f"  {Colors.cyan('Refinement time:')} {Colors.bold(str(round(log['refine_time'], 2)) + 's')}")
+    print(f"  {Colors.cyan('Total time:')} {Colors.bold(str(round(log['mdm_time'] + log['refine_time'], 2)) + 's')}")
     
     if log['total_refinements'] > 0:
         print(f"\n  {Colors.cyan('Refinement statistics:')}")
         print(f"    • Total refinements: {Colors.bold(str(log['total_refinements']))}")
         if 'avg_confidence_improvement' in log:
-            print(f"    • Average confidence gain: {Colors.bold(f'{log['avg_confidence_improvement']:.4f}')}")
+            print(f"    • Average confidence gain: {Colors.bold(str(round(log['avg_confidence_improvement'], 4)))}")
         
         # Show example refinements
         if log['refined_tokens']:
             print(f"\n  {Colors.cyan('Example refinements:')}")
             for ref in log['refined_tokens'][:3]:
                 print(f"    • {Colors.red(repr(ref['old']))} → {Colors.green(repr(ref['new']))} "
-                      f"({Colors.yellow(f'+{ref['improvement']:.3f}')})")
+                      f"({Colors.yellow('+' + str(round(ref['improvement'], 3)))})"")
