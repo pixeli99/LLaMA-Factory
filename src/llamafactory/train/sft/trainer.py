@@ -216,17 +216,6 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
         return final_loss, unweighted_loss, x_t
 
-    def _get_dynamic_ratio(self) -> float:
-        if not hasattr(self.state, "global_step") or not hasattr(self.state, "max_steps"):
-            logger.warning("State not initialized, using default ratio")
-            return 0.9
-
-        progress = self.state.global_step / self.state.max_steps
-        if progress < 1 / 5:
-            return progress * 5
-        else:
-            return 1.0
-
     def save_predictions(
         self, dataset: "Dataset", predict_results: "PredictionOutput", skip_special_tokens: bool = True
     ) -> None:
