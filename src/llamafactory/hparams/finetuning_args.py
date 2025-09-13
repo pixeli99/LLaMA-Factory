@@ -517,6 +517,29 @@ class FinetuningArguments(
         default=False,
         metadata={"help": "Enable Discrete Latent Masking (DiffuCoder) training path in SFT."},
     )
+    # Block-DLM specific switches
+    block_dlm: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Enable Block-DLM training utilities (block-causal attention across thinking/answer blocks). "
+                "Takes effect when use_dlm or use_gidd is enabled."
+            )
+        },
+    )
+    dlm_num_paths: int = field(
+        default=4,
+        metadata={"help": "Default number of parallel thinking paths (blocks) in Block-DLM."},
+    )
+    dlm_add_special_tokens: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Whether to add Block-DLM related special tokens (e.g. [MASK], <THINK_BOS>, <ANS_BOS>, <PATH_i>) "
+                "to the tokenizer automatically at run time."
+            )
+        },
+    )
     use_gidd: bool = field(
         default=False,
         metadata={"help": "Enable GIDD (Generalized Interpolating Discrete Diffusion) training path in SFT."},

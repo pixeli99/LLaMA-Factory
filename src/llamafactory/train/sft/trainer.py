@@ -106,16 +106,6 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
     @override
     def compute_loss(self, model, inputs, *args, **kwargs):
-        # GIDD training path (superset; falls back to MDM when p_u=0)
-        if getattr(self.finetuning_args, "use_gidd", False):
-            src_mask = inputs["labels"] == IGNORE_INDEX
-            final_loss = self.gidd_forward(
-                model,
-                inputs["input_ids"],
-                src_mask,
-            )
-            return final_loss
-
         # DLM training path
         if getattr(self.finetuning_args, "use_dlm", False):
             src_mask = inputs["labels"] == IGNORE_INDEX
@@ -145,17 +135,6 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             labels = inputs.pop("labels", None)
         else:
             labels = inputs.get("labels")
-
-        # GIDD evaluation path
-        if getattr(self.finetuning_args, "use_gidd", False):
-            if self.args.predict_with_generate:
-                labels = inputs.pop("labels", None)
-            else:
-                labels = inputs.get("labels")
-
-            src_mask = labels == IGNORE_INDEX if labels is not None else None
-            loss = self.gidd_forward(model, inputs["input_ids"], src_mask)
-            return loss, None, None
 
         # DLM evaluation path
         if getattr(self.finetuning_args, "use_dlm", False):
@@ -187,235 +166,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         x_t = torch.where(move_indices, torch.as_tensor(mask_token_id, device=x_0.device, dtype=x_0.dtype), x_0)
         return x_t
 
-    # ===================== GIDD helpers (training loss only) =====================
-    def _gidd_mixing_schedule(self, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        pu = torch.as_tensor(self.finetuning_args.gidd_pu, device=t.device, dtype=t.dtype)
-        gamma = torch.as_tensor(self.finetuning_args.gidd_gamma, device=t.device, dtype=t.dtype)
-        eps = torch.as_tensor(self.finetuning_args.gidd_eps, device=t.device, dtype=t.dtype)
-
-        B = (2.0 ** gamma) * pu / torch.clamp(1.0 - pu, min=eps)
-        c_t = B * torch.pow(t, gamma / 2.0) * torch.pow(1.0 - t, gamma / 2.0)
-        C_t = 1.0 + c_t
-        alpha_t = (1.0 - t) / C_t
-        beta_t = 1.0 - alpha_t
-        return alpha_t, beta_t, c_t, C_t, B
-
-    def _compute_pi_derivative(self, t: torch.Tensor, c_t: torch.Tensor, C_t: torch.Tensor, m: torch.Tensor, u: torch.Tensor, beta_t: torch.Tensor) -> torch.Tensor:
-        """
-        Compute the time derivative of π_t according to GIDD paper.
-        
-        From the paper:
-        π_t = (βt*πt) / βt where βt*πt = (t/Ct)*m + (ct/Ct)*u
-        
-        We need to compute d/dt[π_t] = d/dt[(βt*πt)/βt]
-        """
-        gamma = torch.as_tensor(self.finetuning_args.gidd_gamma, device=t.device, dtype=t.dtype)
-        eps = self.finetuning_args.gidd_eps
-        
-        # Compute c_t derivative: c'_t = B * γ/2 * (1-2t) / [t(1-t)] * c_t
-        # This follows from equation (65) in the paper
-        c_t_derivative = (gamma / 2.0) * (1.0 - 2.0 * t) / torch.clamp(t * (1.0 - t), min=eps) * c_t
-        
-        # Compute C_t derivative: C'_t = c'_t
-        C_t_derivative = c_t_derivative
-        
-        # Compute β_t derivative: β'_t = -α'_t where α_t = (1-t)/C_t
-        # α'_t = -1/C_t - (1-t)*C'_t/C_t^2 = -1/C_t - (1-t)*c'_t/C_t^2
-        alpha_t_derivative = -1.0 / C_t - (1.0 - t) * C_t_derivative / (C_t ** 2)
-        beta_t_derivative = -alpha_t_derivative
-        
-        # Compute (βt*πt)' = d/dt[(t/Ct)*m + (ct/Ct)*u]
-        # = (1/Ct - t*C't/Ct^2)*m + (c't/Ct - ct*C't/Ct^2)*u
-        beta_pi_derivative = (
-            (1.0 / C_t - t * C_t_derivative / (C_t ** 2)) * m +
-            (c_t_derivative / C_t - c_t * C_t_derivative / (C_t ** 2)) * u
-        )
-        
-        # Compute π'_t using quotient rule: π'_t = [(βt*πt)' * βt - (βt*πt) * β't] / βt^2
-        beta_pi = (t / C_t) * m + (c_t / C_t) * u
-        pi_t_derivative = (
-            (beta_pi_derivative * beta_t - beta_pi * beta_t_derivative) / 
-            torch.clamp(beta_t ** 2, min=eps)
-        )
-        
-        return pi_t_derivative
-
-    def _compute_gidd_weights(
-        self, 
-        x_t: torch.Tensor, 
-        x_onehot: torch.Tensor, 
-        qx_t: torch.Tensor,
-        alpha_t: torch.Tensor,
-        beta_t: torch.Tensor, 
-        pi_t: torch.Tensor, 
-        pi_t_derivative: torch.Tensor,
-        vocab_size: int,
-        t: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Compute the theoretical GIDD weights according to equation (13) in the paper:
-        wt(zt,x) = (1/qt(zt|x)) * zt^T * (βt*π't - (α't/αt)*πt)
-        """
-        eps = self.finetuning_args.gidd_eps
-        
-        # Compute α't/αt (derivative of log alpha)
-        # From α_t = (1-t)/C_t, we get α't/αt = d/dt[log α_t]
-        gamma = torch.as_tensor(self.finetuning_args.gidd_gamma, device=x_t.device, dtype=x_t.dtype)
-        pu = torch.as_tensor(self.finetuning_args.gidd_pu, device=x_t.device, dtype=x_t.dtype)
-        B = (2.0 ** gamma) * pu / torch.clamp(1.0 - pu, min=eps)
-        
-        # Use the passed time parameter
-        t_b = t  # t is already (batch, 1)
-        
-        # Compute derivatives
-        c_t = B * torch.pow(t_b, gamma / 2.0) * torch.pow(1.0 - t_b, gamma / 2.0)
-        C_t = 1.0 + c_t
-        c_t_derivative = (gamma / 2.0) * (1.0 - 2.0 * t_b) / torch.clamp(t_b * (1.0 - t_b), min=eps) * c_t
-        C_t_derivative = c_t_derivative
-        
-        # α't/αt = d/dt[log(α_t)]
-        alpha_t_log_derivative = -1.0 / (1.0 - t_b) - C_t_derivative / C_t
-        
-        # Compute the weight term: βt*π't - (α't/αt)*πt
-        # Note: we need to be careful about broadcasting
-        alpha_t_expanded = alpha_t.view(-1, 1, 1)  # (batch, 1, 1)
-        beta_t_expanded = beta_t.view(-1, 1, 1)    # (batch, 1, 1)
-        alpha_log_deriv_expanded = alpha_t_log_derivative.view(-1, 1, 1)  # (batch, 1, 1)
-        
-        weight_term = beta_t_expanded * pi_t_derivative - alpha_log_deriv_expanded * pi_t
-        
-        # Compute zt^T * weight_term for each position
-        # x_t is (batch, seq_len), we need one-hot version
-        x_t_onehot = F.one_hot(x_t, num_classes=vocab_size).float()  # (batch, seq_len, vocab)
-        
-        # Compute zt^T * (βt*π't - (α't/αt)*πt) 
-        # This gives us the numerator of the weight function
-        weight_numerator = (x_t_onehot * weight_term).sum(dim=-1)  # (batch, seq_len)
-        
-        # Compute 1/qt(zt|x) - this is the inverse of the marginal probability
-        # qt(zt|x) = αt * xt + βt * πt, evaluated at zt
-        qt_zt_x = (qx_t * x_t_onehot).sum(dim=-1).clamp_min(eps)  # (batch, seq_len)
-        
-        # Final weight: wt(zt,x) = (1/qt(zt|x)) * zt^T * (βt*π't - (α't/αt)*πt)
-        weights = weight_numerator / qt_zt_x
-        
-        # Apply weight clamping for numerical stability (similar to original implementation)
-        wmax = getattr(self.finetuning_args, 'gidd_wmax', 10.0)
-        weights = torch.clamp(weights, min=-wmax, max=wmax)
-        
-        return weights
-
-    def _gidd_build_pi_t(self, t: torch.Tensor, vocab_size: int, mask_token_id: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        alpha_t, beta_t, c_t, C_t, B = self._gidd_mixing_schedule(t)
-        device = t.device
-        V = vocab_size
-        # m one-hot and uniform excluding mask
-        m = torch.zeros(V, device=device, dtype=t.dtype)
-        m[mask_token_id] = 1.0
-        u = torch.ones(V, device=device, dtype=t.dtype)
-        u[mask_token_id] = 0.0
-        u = u / max(1, V - 1)
-        beta_pi = (t / C_t) * m + (c_t / C_t) * u
-        pi_t = beta_pi / torch.clamp(beta_t, min=self.finetuning_args.gidd_eps)
-        
-        # Compute pi_t derivative for GIDD weights
-        pi_t_derivative = self._compute_pi_derivative(t, c_t, C_t, m, u, beta_t)
-        
-        # Ensure pi_t broadcasts over sequence length: (B, 1, V)
-        pi_t = pi_t.unsqueeze(-2)
-        pi_t_derivative = pi_t_derivative.unsqueeze(-2)
-        return alpha_t, beta_t, pi_t, pi_t_derivative, B
-
-    def _gidd_sample_z_t(self, x_ids: torch.Tensor, t: torch.Tensor, vocab_size: int, mask_id: int) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
-        gamma = self.finetuning_args.gidd_gamma
-        pu = self.finetuning_args.gidd_pu
-        eps = self.finetuning_args.gidd_eps
-        B = (2.0 ** gamma) * pu / max(eps, (1.0 - pu))
-        c_t = B * (t ** (gamma / 2.0)) * ((1.0 - t) ** (gamma / 2.0))
-        C_t = 1.0 + c_t
-        alpha_t = (1.0 - t) / C_t
-        p_mask = t / C_t
-        p_unif = c_t / C_t
-
-        u = torch.rand_like(x_ids.float())
-        z = x_ids.clone()
-        stay = (u < alpha_t)
-        u2 = torch.rand_like(x_ids.float())
-        mask_region = (~stay) & (u2 < p_mask / (p_mask + p_unif + eps))
-        z[mask_region] = mask_id
-        unif_region = (~stay) & (~mask_region)
-        if unif_region.any():
-            r = torch.randint(low=0, high=vocab_size - 1, size=(int(unif_region.sum().item()),), device=x_ids.device)
-            r = r + (r >= mask_id).long()
-            z[unif_region] = r
-        return z, (alpha_t, p_mask, p_unif, C_t)
-
-    def gidd_forward(
-        self,
-        model: "torch.nn.Module",
-        x: torch.Tensor,
-        src_mask: Optional[torch.Tensor],
-        sampling_eps: float = 1e-4,
-    ) -> torch.Tensor:
-        if src_mask is None:
-            src_mask = torch.zeros_like(x, device=x.device, dtype=torch.bool)
-
-        t = (1 - 2 * sampling_eps) * torch.rand(x.shape[0], device=x.device) + sampling_eps
-        t_b = t.view(-1, 1)
-
-        mask_token_id = getattr(getattr(self, "processing_class", None), "mask_token_id", None)
-        if mask_token_id is None:
-            pad_id = getattr(getattr(self, "processing_class", None), "pad_token_id", None)
-            mask_token_id = pad_id if pad_id is not None else 0
-        # Minimal, stable vocab size inference:
-        base = getattr(model, "module", model)
-        get_out = getattr(base, "get_output_embeddings", None)
-        if callable(get_out) and getattr(get_out(), "num_embeddings", None):
-            vocab_size = int(get_out().num_embeddings)
-        else:
-            get_in = getattr(base, "get_input_embeddings", None)
-            if callable(get_in) and getattr(get_in(), "num_embeddings", None):
-                vocab_size = int(get_in().num_embeddings)
-            else:
-                vocab_size = int(getattr(getattr(base, "config", {}), "vocab_size", 0) or 32000)
-
-        x_t, (alpha_t, p_mask, p_unif, C_t) = self._gidd_sample_z_t(x, t_b, vocab_size, mask_token_id)
-        x_t = torch.where(src_mask, x, x_t)
-
-        logits = model(input_ids=x_t, attention_mask=None).logits
-        logits = logits[:, :-1, :]
-        x_theta = logits.log_softmax(dim=-1).exp()
-        x = x[:, 1:]
-        x_t = x_t[:, 1:]
-        src_mask = src_mask[:, 1:]
-
-        alpha_s, beta_s, pi_t_vec, pi_t_derivative, B = self._gidd_build_pi_t(t_b, vocab_size, mask_token_id)
-        x_onehot = F.one_hot(x, num_classes=vocab_size).float()
-        alpha_b = alpha_s.view(-1, 1, 1)
-        beta_b = beta_s.view(-1, 1, 1)
-        pi_vec = pi_t_vec
-        qx_t = (alpha_b * x_onehot) + (beta_b * pi_vec)
-        qx_t = qx_t.clamp_min(self.finetuning_args.gidd_eps)
-        qtheta_t = (alpha_b * x_theta) + (beta_b * pi_vec)
-        qtheta_t = qtheta_t.clamp_min(self.finetuning_args.gidd_eps)
-
-        kl = (qx_t * (qx_t.log() - qtheta_t.log())).sum(dim=-1)
-        z_onehot = F.one_hot(x_t, num_classes=vocab_size).float()
-        p = (qx_t * z_onehot).sum(dim=-1).clamp_min(self.finetuning_args.gidd_eps)
-        q = (qtheta_t * z_onehot).sum(dim=-1).clamp_min(self.finetuning_args.gidd_eps)
-        ratio = p / q
-        is_term = ratio - ratio.log() - 1.0
-
-        # Compute theoretical GIDD weights: wt(zt,x) = (1/qt(zt|x)) * zt^T * (βt*π't - (α't/αt)*πt)
-        weights_gidd = self._compute_gidd_weights(
-            x_t, x_onehot, qx_t, alpha_s, beta_s, pi_vec, pi_t_derivative, vocab_size, t_b
-        )
-
-        valid_mask = (~src_mask).float()
-        loss_tokens = valid_mask * weights_gidd * (kl + is_term)
-        denom = valid_mask.sum(dim=-1).clamp_min(1)
-        loss = (loss_tokens.sum(dim=-1) / denom).mean()
-        return loss
+    # (GIDD code removed per request)
 
     def diffusion_forward(
         self,
@@ -438,7 +189,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         # Apply noise to input
         x_t = self.transition(x, sigma[:, None], maskable_mask=~src_mask)
 
-        # Forward pass (intentionally no attention mask)
+        # Forward pass (no custom attention mask; standard SFT)
         logits = model(input_ids=x_t, attention_mask=None).logits
 
         # Apply mask for loss computation

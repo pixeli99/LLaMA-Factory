@@ -47,6 +47,23 @@ def run_sft(
 ):
     tokenizer_module = load_tokenizer(model_args)
     tokenizer = tokenizer_module["tokenizer"]
+    # Register only required special tokens for data markup
+    if getattr(finetuning_args, "dlm_add_special_tokens", True):
+        addl = {"additional_special_tokens": []}
+        base_tokens = ["<Parallel>", "</Parallel>", "<Path>", "</Path>", "<Summary>", "</Summary>"]
+        for tok in base_tokens:
+            try:
+                _ = tokenizer.convert_tokens_to_ids(tok)
+            except Exception:
+                addl["additional_special_tokens"].append(tok)
+        if len(addl["additional_special_tokens"]) > 0:
+            tokenizer.add_special_tokens(addl)
+            try:
+                from ...hparams import ModelArguments
+                setattr(model_args, "resize_vocab", True)
+            except Exception:
+                pass
+
     template = get_template_and_fix_tokenizer(tokenizer, data_args)
     dataset_module = get_dataset(template, model_args, data_args, training_args, stage="sft", **tokenizer_module)
     model = load_model(tokenizer, model_args, finetuning_args, training_args.do_train)
